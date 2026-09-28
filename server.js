@@ -15,8 +15,25 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
 
-// Petit serveur HTTP (pour que Render voie le service "vivant")
+// ============================================================
+//  MISE A JOUR : derniere version publiee de l'app LocalDesk.
+//  >>> Pour publier une mise a jour : monte "version" ici,
+//  mets l'URL de telechargement, et redeploie le relais.
+//  Toutes les apps plus anciennes afficheront la banniere.
+// ============================================================
+const LATEST_APP = {
+  version: "1.0.0",
+  url: "https://github.com/sashaqoq126-wq/localdesk-relay/releases",
+  notes: "Dernière version de LocalDesk.",
+};
+
+// Petit serveur HTTP (sante + endpoint de version)
 const server = http.createServer((req, res) => {
+  if (req.url === "/version") {
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify(LATEST_APP));
+    return;
+  }
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("LocalDesk relay OK\n");
 });
@@ -25,12 +42,44 @@ const wss = new WebSocketServer({ server });
 
 const hosts = new Map(); // id -> socket de l'hote
 
+// ------------------------------------------------------------
+//  Keepalive : empeche l'hebergeur de fermer les connexions
+//  inactives, ce qui ferait "disparaitre" un hote du relais.
+// ------------------------------------------------------------
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      // Pas de reponse au ping precedent -> connexion morte, on nettoie
+      if (ws.role === "host" && ws.id && hosts.get(ws.id) === ws) hosts.delete(ws.id);
+      if (ws.partner && ws.partner.readyState === 1) {
+        ws.partner.send(JSON.stringify({ type: "session-end" }));
+        ws.partner.partner = null;
+      }
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
+  });
+}, 25000);
+wss.on("close", () => clearInterval(heartbeat));
+
 wss.on("connection", (ws) => {
   ws.role = null;
   ws.partner = null;
   ws.id = null;
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
 
   ws.on("message", (data, isBinary) => {
+    ws.isAlive = true; // toute activite compte comme "vivant"
+    // Message de keepalive applicatif : on l'absorbe (sauf si relie)
+    if (!ws.partner && !isBinary) {
+      const s = data.toString();
+      if (s === "ping" || s.indexOf('"ping"') !== -1) {
+        try { ws.send('{"type":"pong"}'); } catch (_) {}
+        return;
+      }
+    }
     // Une fois relies, on transfere tout tel quel au partenaire
     if (ws.partner && ws.partner.readyState === 1) {
       ws.partner.send(data, { binary: isBinary });
