@@ -11,9 +11,43 @@
 // ============================================================
 
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
+
+// ============================================================
+//  RELAIS API « ParaHost Control » (ajout)
+//  Le bot ParaHost se connecte ici (sortant) avec le role "parahost-bot".
+//  L'application fait ses requetes HTTP /api/... sur ce relais, qui les
+//  transmet au bot et renvoie la reponse. Aucun port a ouvrir sur l'hebergeur du bot.
+// ============================================================
+const RELAY_SECRET = process.env.RELAY_SECRET || "";
+let parahostBot = null;            // socket du bot ParaHost connecte
+const apiPending = new Map();      // id -> { res, timer } (requetes de l'app en attente de reponse)
+
+function handleApiRequest(req, res) {
+  if (!parahostBot || parahostBot.readyState !== 1) {
+    res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ ok: false, error: "Bot hors ligne (le relais fonctionne, mais le bot n'est pas connecte au relais)." }));
+    return;
+  }
+  const chunks = [];
+  let size = 0, over = false;
+  req.on("data", (c) => { size += c.length; if (size > 2000000) over = true; if (!over) chunks.push(c); });
+  req.on("end", () => {
+    if (over) { res.writeHead(413, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ ok: false, error: "Requete trop grande." })); return; }
+    const id = crypto.randomBytes(8).toString("hex");
+    const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || (req.socket && req.socket.remoteAddress) || "";
+    const timer = setTimeout(() => {
+      if (apiPending.has(id)) { apiPending.delete(id); if (!res.headersSent) { res.writeHead(504, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ ok: false, error: "Le bot a mis trop de temps a repondre." })); } }
+    }, 25000);
+    apiPending.set(id, { res, timer });
+    try { parahostBot.send(JSON.stringify({ type: "req", id, method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString("utf8"), ip })); }
+    catch (e) { clearTimeout(timer); apiPending.delete(id); if (!res.headersSent) { res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ ok: false, error: "Relais: envoi au bot impossible." })); } }
+  });
+  req.on("error", () => {});
+}
 
 // ============================================================
 //  MISE A JOUR : derniere version publiee de l'app LocalDesk.
@@ -34,6 +68,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(LATEST_APP));
     return;
   }
+  if (req.url && req.url.indexOf("/api") === 0) return handleApiRequest(req, res);
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("LocalDesk relay OK\n");
 });
@@ -80,6 +115,24 @@ wss.on("connection", (ws) => {
         return;
       }
     }
+    // Reponses d'API renvoyees par le bot ParaHost
+    if (ws.isParahostBot && !isBinary) {
+      let m;
+      try { m = JSON.parse(data.toString()); } catch (_) { return; }
+      if (m.type === "res") {
+        const p = apiPending.get(m.id);
+        if (p) {
+          apiPending.delete(m.id);
+          clearTimeout(p.timer);
+          if (!p.res.headersSent) {
+            p.res.writeHead(m.status || 200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+            p.res.end(m.body || "");
+          }
+        }
+      }
+      return;
+    }
+
     // Une fois relies, on transfere tout tel quel au partenaire
     if (ws.partner && ws.partner.readyState === 1) {
       ws.partner.send(data, { binary: isBinary });
@@ -96,6 +149,18 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "hello") {
+      if (msg.role === "parahost-bot") {
+        // Le bot ParaHost s'enregistre (secret partage obligatoire)
+        if (RELAY_SECRET && msg.secret === RELAY_SECRET) {
+          parahostBot = ws;
+          ws.isParahostBot = true;
+          try { ws.send(JSON.stringify({ type: "ready" })); } catch (_) {}
+          console.log("ParaHost bot connecte au relais API");
+        } else {
+          try { ws.send(JSON.stringify({ type: "denied" })); } catch (_) {}
+        }
+        return;
+      }
       if (msg.role === "host") {
         // Un PC se rend joignable via son ID
         ws.role = "host";
@@ -121,6 +186,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    if (ws === parahostBot) parahostBot = null;
     if (ws.role === "host" && ws.id && hosts.get(ws.id) === ws) {
       hosts.delete(ws.id);
     }
